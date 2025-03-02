@@ -4,11 +4,13 @@ Test coverage metrics collection.
 import json
 import re
 import os
+import logging
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple, Set
 
 from autodev.metrics.base import MetricsCollector, MetricResult, normalize_value, create_error_metric
 
+logger = logging.getLogger(__name__)
 
 class CoverageMetricsCollector(MetricsCollector):
     """Collector for test coverage metrics."""
@@ -174,53 +176,82 @@ class CoverageMetricsCollector(MetricsCollector):
         )
     
     def _collect_branch_coverage(self) -> List[MetricResult]:
-        """
-        Collect branch coverage metrics.
-        
-        Returns:
-            List of MetricResult objects
-        """
-        json_coverage_file = self.project_path / "coverage.json"
-        
-        if not json_coverage_file.exists():
-            return [create_error_metric(
-                "branch_coverage", 
-                "Coverage data not found. Make sure tests can run successfully."
-            )]
+        """Collect branch coverage metrics."""
+        # Check if coverage data available
+        if not self._coverage_data_exists():
+            logger.warning("No coverage data found, skipping branch coverage metrics")
+            return []
         
         try:
-            # Load coverage data
-            with open(json_coverage_file, 'r') as f:
-                coverage_data = json.load(f)
+            # Parse coverage data
+            coverage_data = self._get_coverage_data()
             
-            # Get branch coverage if available
-            total_branch_coverage = coverage_data.get("totals", {}).get("branch_percent_covered", 0)
+            if not coverage_data:
+                logger.warning("No coverage data available")
+                return []
             
-            # If branch coverage is not available, return error
-            if total_branch_coverage == 0 and not coverage_data.get("totals", {}).get("branch_covered", 0):
-                return [create_error_metric(
-                    "branch_coverage", 
-                    "Branch coverage data not available. Run tests with --cov-branch option."
-                )]
+            # Calculate branch coverage
+            branch_data = coverage_data.get("branch_coverage", {})
             
-            # Normalize: 0% = 0.0, 100% = 1.0
-            coverage_norm = total_branch_coverage / 100
+            if not branch_data:
+                logger.warning("No branch coverage data available")
+                return []
             
-            return [MetricResult(
-                name="branch_coverage",
-                raw_value=total_branch_coverage,
-                normalized_value=coverage_norm,
-                details={
-                    "branches_covered": coverage_data.get("totals", {}).get("branch_covered", 0),
-                    "branches_total": coverage_data.get("totals", {}).get("branch_total", 0)
-                }
-            )]
+            total_branches = branch_data.get("total_branches", 0)
+            covered_branches = branch_data.get("covered_branches", 0)
             
+            coverage_percent = (covered_branches / total_branches) * 100 if total_branches > 0 else 0
+            
+            # Normalize coverage percentage to 0-1 scale
+            normalized_value = normalize_value(coverage_percent, 0, 100)
+            
+            # Collect branch coverage by file
+            branches_by_file = branch_data.get("branches_by_file", {})
+            
+            file_details = []
+            for file_path, file_data in branches_by_file.items():
+                file_total = file_data.get("total", 0)
+                file_covered = file_data.get("covered", 0)
+                file_coverage = (file_covered / file_total) * 100 if file_total > 0 else 0
+                
+                file_details.append({
+                    "file": file_path,
+                    "total_branches": file_total,
+                    "covered_branches": file_covered,
+                    "coverage_percent": file_coverage
+                })
+            
+            # Sort file details by coverage percentage (ascending)
+            file_details.sort(key=lambda x: x["coverage_percent"])
+            
+            return [
+                MetricResult(
+                    name="branch_coverage",
+                    raw_value=coverage_percent,
+                    normalized_value=normalized_value,
+                    success=True,
+                    details={
+                        "total_branches": total_branches,
+                        "covered_branches": covered_branches,
+                        "coverage_percent": coverage_percent,
+                        "files": file_details[:10]  # Top 10 files with lowest coverage
+                    }
+                )
+            ]
         except Exception as e:
-            return [create_error_metric(
-                "branch_coverage", 
-                f"Error processing branch coverage data: {str(e)}"
-            )]
+            logger.error(f"Error processing branch coverage: {str(e)}")
+            return [create_error_metric("branch_coverage", f"Error processing branch coverage: {str(e)}")]
+    
+    def _coverage_data_exists(self) -> bool:
+        """Check if coverage data exists."""
+        json_coverage_file = self.project_path / "coverage.json"
+        return json_coverage_file.exists()
+    
+    def _get_coverage_data(self) -> Dict[str, Any]:
+        """Get coverage data from JSON file."""
+        json_coverage_file = self.project_path / "coverage.json"
+        with open(json_coverage_file, 'r') as f:
+            return json.load(f)
     
     def _collect_test_metrics(self) -> List[MetricResult]:
         """

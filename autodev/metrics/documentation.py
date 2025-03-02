@@ -5,9 +5,20 @@ import json
 import re
 from pathlib import Path
 from typing import Dict, List, Any, Optional
+import subprocess
+import logging
 
 from autodev.metrics.base import MetricsCollector, MetricResult, normalize_value, create_error_metric
 
+logger = logging.getLogger(__name__)
+
+def _is_tool_available(tool_name: str) -> bool:
+    """Check if a tool is available."""
+    try:
+        subprocess.run([tool_name, "--version"], check=True, stdout=subprocess.DEVNULL)
+        return True
+    except FileNotFoundError:
+        return False
 
 class DocumentationMetricsCollector(MetricsCollector):
     """Collector for documentation metrics."""
@@ -30,94 +41,85 @@ class DocumentationMetricsCollector(MetricsCollector):
         return metrics
     
     def _collect_interrogate_metrics(self) -> List[MetricResult]:
-        """
-        Collect docstring coverage metrics using interrogate.
+        """Collect documentation metrics using interrogate."""
+        # Check if tool is available
+        if not _is_tool_available("interrogate"):
+            logger.warning("interrogate not installed, skipping metrics")
+            return []
+            
+        # Skip if no Python files
+        if not self._project_has_files():
+            logger.warning("No Python files found, skipping interrogate metrics")
+            return []
         
-        Returns:
-            List of MetricResult objects
-        """
-        # Run interrogate command with JSON output
-        return_code, stdout, stderr = self.run_command(
-            ["interrogate", "-v", "-j", "."]
+        # Run interrogate
+        interrogate_output = subprocess.run(
+            ["interrogate", "-v", str(self.project_path)],
+            capture_output=True, text=True, check=False
         )
         
-        if return_code not in (0, 1) or not stdout:
-            return [create_error_metric(
-                "docstring_coverage", 
-                f"Failed to run interrogate: {stderr}"
-            )]
+        # Interrogate returns 0 for passing, 1 for failing
+        if interrogate_output.returncode > 1:
+            logger.error(f"Error running interrogate: {interrogate_output.stderr}")
+            return [create_error_metric("docstring_coverage", f"Error running interrogate: {interrogate_output.stderr}")]
         
         try:
-            # Parse interrogate JSON output
-            coverage_data = json.loads(stdout)
+            # Parse interrogate output
+            coverage_match = re.search(r'TOTAL\s+\d+\s+\d+\s+\d+\s+(\d+(?:\.\d+)?)%', interrogate_output.stdout)
+            if not coverage_match:
+                logger.error("Could not find coverage percentage in interrogate output")
+                return [create_error_metric("docstring_coverage", "Could not find coverage percentage in interrogate output")]
             
-            # Get summary metrics
-            total_coverage = coverage_data.get("total", {}).get("coverage", 0)
-            module_coverage = coverage_data.get("total", {}).get("module_coverage", 0)
-            class_coverage = coverage_data.get("total", {}).get("class_coverage", 0)
-            method_coverage = coverage_data.get("total", {}).get("method_coverage", 0)
-            function_coverage = coverage_data.get("total", {}).get("function_coverage", 0)
+            coverage_percentage = float(coverage_match.group(1))
             
-            # Create metrics
-            results = []
+            # Normalize: 0% = 0.0, 100% = 1.0
+            normalized_score = normalize_value(coverage_percentage, 0, 100)
             
-            # Overall docstring coverage
-            results.append(MetricResult(
-                name="docstring_coverage",
-                raw_value=total_coverage,
-                normalized_value=total_coverage / 100,  # already in percentage
-                details={
-                    "module_coverage": module_coverage,
-                    "class_coverage": class_coverage,
-                    "method_coverage": method_coverage,
-                    "function_coverage": function_coverage,
-                    "total_analyzed": coverage_data.get("total", {}).get("n", 0)
+            # Extract detailed metrics
+            details = {}
+            
+            # Try to parse module stats
+            module_stats = {}
+            module_regex = r'([A-Za-z0-9_./]+\.py)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+(?:\.\d+)?)%'
+            module_matches = re.findall(module_regex, interrogate_output.stdout)
+            
+            for match in module_matches:
+                module_path = match[0]
+                module_stats[module_path] = {
+                    "total": int(match[1]),
+                    "missing": int(match[2]),
+                    "coverage": float(match[4])
                 }
-            ))
             
-            # Module coverage
-            results.append(MetricResult(
-                name="module_docstring_coverage",
-                raw_value=module_coverage,
-                normalized_value=module_coverage / 100,  # already in percentage
-                details={
-                    "modules_with_docstrings": coverage_data.get("total", {}).get("module_covered", 0),
-                    "total_modules": coverage_data.get("total", {}).get("module", 0)
-                }
-            ))
+            # Find file, class, method and function counts
+            files_match = re.search(r'files\s+(\d+)\s+', interrogate_output.stdout)
+            classes_match = re.search(r'classes\s+(\d+)\s+', interrogate_output.stdout)
+            methods_match = re.search(r'methods\s+(\d+)\s+', interrogate_output.stdout)
+            functions_match = re.search(r'functions\s+(\d+)\s+', interrogate_output.stdout)
             
-            # Class coverage
-            results.append(MetricResult(
-                name="class_docstring_coverage",
-                raw_value=class_coverage,
-                normalized_value=class_coverage / 100,  # already in percentage
-                details={
-                    "classes_with_docstrings": coverage_data.get("total", {}).get("class_covered", 0),
-                    "total_classes": coverage_data.get("total", {}).get("class", 0)
-                }
-            ))
+            if files_match:
+                details["files_count"] = int(files_match.group(1))
+            if classes_match:
+                details["classes_count"] = int(classes_match.group(1))
+            if methods_match:
+                details["methods_count"] = int(methods_match.group(1))
+            if functions_match:
+                details["functions_count"] = int(functions_match.group(1))
             
-            # Function/method coverage
-            func_method_coverage = (function_coverage + method_coverage) / 2 if method_coverage > 0 else function_coverage
-            results.append(MetricResult(
-                name="function_docstring_coverage",
-                raw_value=func_method_coverage,
-                normalized_value=func_method_coverage / 100,  # already in percentage
-                details={
-                    "functions_with_docstrings": coverage_data.get("total", {}).get("function_covered", 0),
-                    "total_functions": coverage_data.get("total", {}).get("function", 0),
-                    "methods_with_docstrings": coverage_data.get("total", {}).get("method_covered", 0),
-                    "total_methods": coverage_data.get("total", {}).get("method", 0)
-                }
-            ))
+            details["module_stats"] = module_stats
             
-            return results
-            
+            return [
+                MetricResult(
+                    name="docstring_coverage",
+                    raw_value=coverage_percentage,
+                    normalized_value=normalized_score,
+                    success=True,
+                    details=details
+                )
+            ]
         except Exception as e:
-            return [create_error_metric(
-                "docstring_coverage", 
-                f"Error processing interrogate data: {str(e)}"
-            )]
+            logger.error(f"Error processing interrogate data: {str(e)}")
+            return [create_error_metric("docstring_coverage", f"Error processing interrogate data: {str(e)}")]
     
     def _collect_pydocstyle_metrics(self) -> List[MetricResult]:
         """

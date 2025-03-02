@@ -164,22 +164,21 @@ def normalize_value(
     return normalized
 
 
-def create_error_metric(name: str, error_message: str, fallback_value: float = 0.0) -> MetricResult:
+def create_error_metric(name: str, error_message: str) -> MetricResult:
     """
     Create a metric result for an error condition.
     
     Args:
         name: Name of the metric
         error_message: Error message
-        fallback_value: Fallback normalized value to use for this metric (default: 0.0)
     
     Returns:
         MetricResult object representing the error
     """
     return MetricResult(
         name=name,
-        raw_value=fallback_value * 10,  # scale fallback to match raw scale
-        normalized_value=fallback_value,
+        raw_value=0,
+        normalized_value=0,
         success=False,
         error=error_message
     )

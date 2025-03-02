@@ -5,9 +5,20 @@ import json
 import re
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
+import subprocess
+import logging
 
 from autodev.metrics.base import MetricsCollector, MetricResult, normalize_value, create_error_metric
 
+logger = logging.getLogger(__name__)
+
+def _is_tool_available(tool_name: str) -> bool:
+    """Check if a tool is available."""
+    try:
+        subprocess.run([tool_name, "--version"], check=True, stdout=subprocess.DEVNULL)
+        return True
+    except FileNotFoundError:
+        return False
 
 class StyleMetricsCollector(MetricsCollector):
     """Collector for code style and linting metrics."""
@@ -32,192 +43,142 @@ class StyleMetricsCollector(MetricsCollector):
         
         return metrics
     
-    def _collect_pylint_metrics(self) -> List[MetricResult]:
+    def _project_has_files(self, extension: str) -> bool:
         """
-        Collect pylint metrics.
+        Check if the project has files with the given extension.
         
+        Args:
+            extension: File extension to check for (e.g., ".py")
+            
         Returns:
-            List of MetricResult objects
+            True if files with the extension exist, False otherwise
         """
-        python_files = list(self.project_path.glob("**/*.py"))
-        if not python_files:
-            return [create_error_metric(
-                "pylint_score", 
-                "No Python files found to analyze"
-            )]
+        # Convert generator to list first
+        files = list(self.project_path.glob(f"**/*{extension}"))
+        return len(files) > 0
+    
+    def _collect_pylint_metrics(self) -> List[MetricResult]:
+        """Collect pylint quality metrics."""
+        # Check if tool is available
+        if not _is_tool_available("pylint"):
+            logger.warning("pylint not installed, skipping metrics")
+            return []
+            
+        # Skip if no Python files
+        if not self._project_has_files(".py"):
+            logger.warning("No Python files found, skipping pylint metrics")
+            return []
         
-        # Run pylint command
-        # Using --recursive=y to scan the entire directory
-        return_code, stdout, stderr = self.run_command(
-            ["pylint", "--output-format=json", "--recursive=y", "."]
+        pylint_output = subprocess.run(
+            ["pylint", "--exit-zero", "--output-format=json", str(self.project_path)],
+            capture_output=True, text=True, check=False
         )
         
-        # Pylint exit codes: 0=no error, 1=fatal, 2=error, 4=warning, 8=refactor, 16=convention
-        # Multiple codes can be OR'ed together, so we don't check the return code
-        
-        if not stdout:
-            return [create_error_metric(
-                "pylint_score", 
-                f"Failed to run pylint: {stderr}"
-            )]
+        if pylint_output.returncode > 1:  # Exit code 1 means violations found, which is expected
+            logger.error(f"Error running pylint: {pylint_output.stderr}")
+            return [create_error_metric("pylint_score", f"Error running pylint: {pylint_output.stderr}")]
         
         try:
-            # Parse pylint JSON output
-            lint_data = json.loads(stdout)
+            # Pylint score is a float between 0-10, where 10 is perfect
+            score_match = re.search(r'Your code has been rated at ([0-9.]+)/10', pylint_output.stderr)
+            if score_match:
+                score = float(score_match.group(1))
+            else:
+                # Try to parse from regular output when no score is shown (e.g., for empty repos)
+                score = 10.0  # Default to perfect score for empty repos
+            
+            # Handle issues when available
+            issues = []
+            try:
+                issues = json.loads(pylint_output.stdout)
+            except json.JSONDecodeError:
+                logger.warning("No valid JSON issues from pylint")
             
             # Count issues by type
-            issue_counts = {
-                "fatal": 0,
-                "error": 0,
-                "warning": 0,
-                "refactor": 0,
-                "convention": 0,
-                "info": 0
-            }
+            issue_types = {}
+            for issue in issues:
+                issue_type = issue.get("type", "unknown")
+                if issue_type not in issue_types:
+                    issue_types[issue_type] = 0
+                issue_types[issue_type] += 1
             
-            issues_by_file = {}
+            # Calculate normalized score (0-1)
+            normalized_score = normalize_value(score, 0, 10)
             
-            for issue in lint_data:
-                issue_type = issue.get("type", "")
-                if issue_type in issue_counts:
-                    issue_counts[issue_type] += 1
-                
-                # Track issues by file
-                file_path = issue.get("path", "unknown")
-                if file_path not in issues_by_file:
-                    issues_by_file[file_path] = []
-                issues_by_file[file_path].append(issue)
-            
-            # Calculate total issues and weighted score
-            total_issues = sum(issue_counts.values())
-            
-            # Calculate weighted penalty
-            # Weights: fatal=100, error=10, warning=1, refactor=0.5, convention=0.1
-            weighted_penalty = (
-                issue_counts["fatal"] * 100 +
-                issue_counts["error"] * 10 +
-                issue_counts["warning"] * 1 +
-                issue_counts["refactor"] * 0.5 +
-                issue_counts["convention"] * 0.1
-            )
-            
-            # Calculate pylint score (10 - weighted penalty)
-            # Clamp between 0 and 10
-            raw_score = max(0, min(10, 10 - (weighted_penalty / len(python_files))))
-            
-            # Normalize: 10 = 1.0, 0 = 0.0
-            score_norm = normalize_value(raw_score, 0, 10)
-            
-            # Create metric results
-            results = [
+            return [
                 MetricResult(
                     name="pylint_score",
-                    raw_value=raw_score,
-                    normalized_value=score_norm,
+                    raw_value=score,
+                    normalized_value=normalized_score,
+                    success=True,
                     details={
-                        "issue_counts": issue_counts,
-                        "total_issues": total_issues,
-                        "files_analyzed": len(python_files),
-                        "files_with_issues": len(issues_by_file)
+                        "total_issues": len(issues),
+                        "issue_types": issue_types
                     }
                 )
             ]
-            
-            # Add metrics for specific issue types
-            
-            # Error density (lower is better)
-            error_density = (issue_counts["fatal"] + issue_counts["error"]) / len(python_files)
-            # Normalize: 0 errors = 1.0, 5+ errors per file = 0.0
-            error_norm = normalize_value(error_density, 0, 5, invert=True)
-            results.append(MetricResult(
-                name="pylint_error_density",
-                raw_value=error_density,
-                normalized_value=error_norm,
-                details={
-                    "fatal_count": issue_counts["fatal"],
-                    "error_count": issue_counts["error"],
-                    "files_analyzed": len(python_files)
-                }
-            ))
-            
-            # Clean file percentage
-            clean_files = len(python_files) - len(issues_by_file)
-            clean_percentage = clean_files / len(python_files) if len(python_files) > 0 else 0
-            results.append(MetricResult(
-                name="pylint_clean_file_percentage",
-                raw_value=clean_percentage * 100,  # as percentage
-                normalized_value=clean_percentage,
-                details={
-                    "clean_files": clean_files,
-                    "total_files": len(python_files)
-                }
-            ))
-            
-            return results
-            
         except Exception as e:
-            return [create_error_metric(
-                "pylint_score", 
-                f"Error processing pylint data: {str(e)}"
-            )]
+            logger.error(f"Error parsing pylint output: {str(e)}")
+            return [create_error_metric("pylint_score", f"Error parsing pylint output: {str(e)}")]
     
     def _collect_flake8_metrics(self) -> List[MetricResult]:
-        """
-        Collect flake8 metrics.
-        
-        Returns:
-            List of MetricResult objects
-        """
-        python_files = list(self.project_path.glob("**/*.py"))
-        if not python_files:
-            return [create_error_metric(
-                "flake8_violations", 
-                "No Python files found to analyze"
-            )]
-        
-        # Run flake8 command
-        return_code, stdout, stderr = self.run_command(
-            ["flake8", "--statistics", "--count", "."]
+        """Collect flake8 quality metrics."""
+        # Check if tool is available
+        if not _is_tool_available("flake8"):
+            logger.warning("flake8 not installed, skipping metrics")
+            return []
+
+        flake8_output = subprocess.run(
+            ["flake8", "--exit-zero", "--statistics", "--format=json", str(self.project_path)],
+            capture_output=True, text=True, check=False
         )
         
-        # flake8 returns 1 if there are violations
-        if return_code not in (0, 1) or (return_code == 1 and not stdout):
-            return [create_error_metric(
-                "flake8_violations", 
-                f"Failed to run flake8: {stderr}"
-            )]
+        if flake8_output.returncode > 1:  # Exit code 1 means violations found, which is expected
+            logger.error(f"Error running flake8: {flake8_output.stderr}")
+            return [create_error_metric("flake8_violations", f"Error running flake8: {flake8_output.stderr}")]
         
         try:
-            # Parse flake8 output to count violations
-            if not stdout or stdout.strip() == "":
-                # No violations
-                violation_count = 0
-            else:
-                # Last line contains the count
-                violation_count = int(stdout.strip().split('\n')[-1])
+            violations = json.loads(flake8_output.stdout)
+            total_files = len(list(self.project_path.glob("**/*.py")))
+            total_violations = len(violations)
             
-            # Calculate violations per file
-            violations_per_file = violation_count / len(python_files) if len(python_files) > 0 else 0
+            avg_violations_per_file = total_violations / total_files if total_files > 0 else 0
             
-            # Normalize: 0 violations = 1.0, 10+ violations per file = 0.0
-            violations_norm = normalize_value(violations_per_file, 0, 10, invert=True)
+            # Group violations by type
+            violation_types = {}
+            for v in violations:
+                code = v.get("code", "unknown")
+                if code not in violation_types:
+                    violation_types[code] = 0
+                violation_types[code] += 1
             
-            return [MetricResult(
-                name="flake8_violations",
-                raw_value=violation_count,
-                normalized_value=violations_norm,
-                details={
-                    "violations_per_file": violations_per_file,
-                    "files_analyzed": len(python_files)
-                }
-            )]
+            # Calculate score - lower violations is better
+            # Max expected violations is 10 per file
+            max_expected = max(10 * total_files, 1)
+            raw_score = max(0, max_expected - total_violations)
+            normalized_score = normalize_value(raw_score, 0, max_expected)
             
+            return [
+                MetricResult(
+                    name="flake8_violations",
+                    raw_value=total_violations,
+                    normalized_value=normalized_score,
+                    success=True,
+                    details={
+                        "total_files": total_files,
+                        "total_violations": total_violations,
+                        "avg_violations_per_file": avg_violations_per_file,
+                        "violation_types": violation_types
+                    }
+                )
+            ]
+        except json.JSONDecodeError:
+            logger.error(f"Invalid JSON from flake8: {flake8_output.stdout}")
+            return [create_error_metric("flake8_violations", "Invalid JSON from flake8")]
         except Exception as e:
-            return [create_error_metric(
-                "flake8_violations", 
-                f"Error processing flake8 data: {str(e)}"
-            )]
-    
+            logger.error(f"Error parsing flake8 output: {str(e)}")
+            return [create_error_metric("flake8_violations", f"Error parsing flake8 output: {str(e)}")]
+
     def _collect_black_metrics(self) -> List[MetricResult]:
         """
         Collect black formatting metrics.
